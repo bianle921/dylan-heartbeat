@@ -1868,6 +1868,140 @@ app.post("/mcp", async (req, reply) => {
 });
 
 // ========================
+// 日记页面（在线 HTML，Basic Auth；与 MCP 落盘同一本日记）
+// ========================
+const DIARY_PAGE_HTML = `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>日记本</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:"Noto Serif SC",Georgia,serif;background:linear-gradient(135deg,#f8f0f3 0%,#f5e6eb 100%);min-height:100vh;padding:18px;color:#3a2b30}
+  .wrap{max-width:640px;margin:0 auto}
+  h1{font-size:22px;font-weight:700;margin-bottom:4px}
+  .sub{font-size:13px;color:#9a7b84;margin-bottom:16px}
+  .card{background:#fff;border-radius:16px;padding:16px;box-shadow:0 6px 20px rgba(180,120,140,.12);margin-bottom:16px}
+  label{display:block;font-size:13px;color:#7a5b64;margin:10px 0 6px}
+  textarea,input{width:100%;border:1px solid #ecd2da;border-radius:10px;padding:10px;font-family:inherit;font-size:15px;background:#fdf7f9;color:#3a2b30}
+  textarea{min-height:110px;resize:vertical}
+  .row{display:flex;gap:10px}
+  .row>div{flex:1}
+  button{margin-top:14px;width:100%;border:0;border-radius:12px;padding:12px;font-size:15px;font-family:inherit;font-weight:600;color:#fff;background:linear-gradient(135deg,#b96a86,#9a4f6b)}
+  button:active{opacity:.85}
+  .msg{margin-top:10px;font-size:13px;min-height:18px}
+  .ok{color:#3f8a5f} .err{color:#b34a5a}
+  .entry{border-bottom:1px dashed #ecd2da;padding:12px 0}
+  .entry:last-child{border-bottom:0}
+  .entry h3{font-size:15px;font-weight:600;margin-bottom:6px}
+  .entry .meta{font-size:12px;color:#9a7b84;margin-bottom:6px}
+  .entry pre{white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.7;font-family:inherit}
+  .empty{color:#9a7b84;font-size:14px;text-align:center;padding:30px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>日记本</h1>
+  <div class="sub">和小机一起记下今天值得留的事</div>
+  <div class="card">
+    <label>正文</label>
+    <textarea id="content" placeholder="今天发生了什么……"></textarea>
+    <div class="row">
+      <div><label>情绪（可选）</label><input id="mood" placeholder="开心 / 平静 / 想念"></div>
+      <div><label>标签（可选，逗号分隔）</label><input id="tags" placeholder="日常, 心情"></div>
+    </div>
+    <label>小标题（可选）</label>
+    <input id="summary" placeholder="一句话标题">
+    <button id="saveBtn">存进日记</button>
+    <div class="msg" id="msg"></div>
+  </div>
+  <div class="card" id="listCard">
+    <div id="list">加载中……</div>
+  </div>
+</div>
+<script>
+  var listEl = document.getElementById("list");
+  var msgEl = document.getElementById("msg");
+  var authHeader = null;
+  (function(){
+    var u = location.username, p = location.password;
+    if(u){ authHeader = "Basic " + btoa(u + ":" + p); }
+  })();
+  function authHeaders(extra){
+    var h = extra || {};
+    if(authHeader){ h["Authorization"] = authHeader; }
+    return h;
+  }
+  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+  async function load(){
+    try{
+      var r = await fetch("/diary/entries?limit=30", { headers: authHeaders() });
+      if(!r.ok) throw new Error("HTTP "+r.status);
+      var d = await r.json();
+      if(!d.count){ listEl.innerHTML = '<div class="empty">还没有日记，写下第一条吧。</div>'; return; }
+      listEl.innerHTML = d.entries.map(function(e){
+        var t = e.updated_at ? new Date(e.updated_at).toLocaleString("zh-CN",{timeZone:"Asia/Shanghai"}) : "";
+        return '<div class="entry"><h3>'+esc(e.date)+'</h3><div class="meta">'+esc(t)+'</div><pre>'+esc(e.preview)+'</pre></div>';
+      }).join("");
+    }catch(e){ listEl.innerHTML = '<div class="empty">加载失败：'+esc(e.message)+'</div>'; }
+  }
+  document.getElementById("saveBtn").addEventListener("click", async function(){
+    var content = document.getElementById("content").value.trim();
+    if(!content){ msgEl.className="msg err"; msgEl.textContent="正文不能为空"; return; }
+    var tagsRaw = document.getElementById("tags").value.trim();
+    var payload = {
+      content: content,
+      mood: document.getElementById("mood").value.trim(),
+      summary: document.getElementById("summary").value.trim(),
+      tags: tagsRaw ? tagsRaw.split(/[,，]/).map(function(x){return x.trim();}).filter(Boolean) : []
+    };
+    msgEl.className="msg"; msgEl.textContent="保存中……";
+    try{
+      var r = await fetch("/diary/entries",{method:"POST",headers:authHeaders({"Content-Type":"application/json"}),body:JSON.stringify(payload)});
+      var d = await r.json();
+      if(d.ok){
+        msgEl.className="msg ok"; msgEl.textContent="已存进日记 ✓";
+        document.getElementById("content").value="";
+        document.getElementById("mood").value="";
+        document.getElementById("tags").value="";
+        document.getElementById("summary").value="";
+        load();
+      }else{
+        msgEl.className="msg err"; msgEl.textContent = d.reason==="already_exists" ? "这件事今天已经记过啦" : (d.message||"保存失败");
+      }
+    }catch(e){ msgEl.className="msg err"; msgEl.textContent="请求失败："+e.message; }
+  });
+  load();
+</script>
+</body>
+</html>`;
+
+app.get("/diary/entries", { preHandler: basicAuth }, async (req, reply) => {
+  reply.send(listDiaryEntries({ limit: Math.min(Math.max(Number(req.query.limit) || 30, 1), 30) }));
+});
+
+app.post("/diary/entries", { preHandler: basicAuth }, async (req, reply) => {
+  const body = req.body || {};
+  const tags = Array.isArray(body.tags)
+    ? body.tags
+    : typeof body.tags === "string"
+      ? body.tags.split(/[,，]/).map(t => t.trim()).filter(Boolean)
+      : [];
+  reply.send(writeDiaryEntry({
+    content: body.content,
+    mood: body.mood,
+    tags,
+    summary: body.summary
+  }));
+});
+
+app.get("/diary", { preHandler: basicAuth }, async (req, reply) => {
+  reply.type("text/html").send(DIARY_PAGE_HTML);
+});
+
+// ========================
 // 管理页一键重启
 // ========================
 app.post("/admin/restart", { preHandler: basicAuth }, async (req, reply) => {
