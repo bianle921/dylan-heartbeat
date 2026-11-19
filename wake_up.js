@@ -171,7 +171,18 @@ function getWakeAfterMinutes(date = new Date()) {
     : readNumberEnv("NIGHT_WAKE_AFTER_MINUTES", 120, { min: 1 });
 }
 
+// 夜间是否允许主动唤醒；默认关闭，避免半夜反复调模型浪费 token。
+// 设为 true 后才按 NIGHT_WAKE_AFTER_MINUTES / NIGHT_CHECK_INTERVAL_MINUTES 在夜间唤醒。
+function nightWakeEnabled(date = new Date()) {
+  if (isDayTime(date)) return true;
+  return readBooleanEnv("NIGHT_WAKE_ENABLED", false);
+}
+
 function getCheckIntervalMinutes(date = new Date()) {
+  if (!nightWakeEnabled(date)) {
+    // 夜间不唤醒时拉长检查间隔，只保留心跳保活，避免反复空跑。
+    return readNumberEnv("NIGHT_CHECK_INTERVAL_MINUTES", 120, { min: 10 });
+  }
   return isDayTime(date)
     ? readNumberEnv("DAY_CHECK_INTERVAL_MINUTES", 10, { min: 1 })
     : readNumberEnv("NIGHT_CHECK_INTERVAL_MINUTES", 120, { min: 1 });
@@ -455,6 +466,11 @@ async function runWakeUp() {
 
   const now = new Date();
   const diffMinutes = Math.floor((now - lastUserTime) / 1000 / 60);
+
+  if (!nightWakeEnabled(now)) {
+    console.log("\n夜间不主动唤醒（NIGHT_WAKE_ENABLED=false）\n");
+    return;
+  }
 
   if (!shouldWake(lastUserTime)) {
     console.log("\n暂不需要唤醒\n");
