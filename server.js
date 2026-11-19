@@ -15,7 +15,8 @@ const { decideRequestAccess } = require("./network_access");
 const {
   formatDateTimeInTimeZone,
   resolveTimeZone,
-  zonedWallTimeToDate
+  zonedWallTimeToDate,
+  getDatePartsInTimeZone
 } = require("./time_utils");
 
 const DEFAULT_BODY_LIMIT_MB = 50;
@@ -1718,6 +1719,152 @@ app.post("/admin/presets/delete", { preHandler: basicAuth }, async (req, reply) 
 app.post("/internal/heartbeat", async (req, reply) => {
   wakeUpLastHeartbeat = Date.now();
   reply.send({ status: "ok" });
+});
+
+// ========================
+// 日记 MCP（Streamable HTTP / JSON-RPC 2.0）
+// 工具只做落盘与读取，不调用上游大模型；日记正文由对话侧模型顺带生成。
+// ========================
+const DIARY_MCP_MAX_CONTENT = 2000;
+const DIARY_MCP_PREVIEW = 300;
+
+function diaryDateString(date = new Date()) {
+  const p = getDatePartsInTimeZone(date, TIME_ZONE);
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+function diaryTimeString(date = new Date()) {
+  const p = getDatePartsInTimeZone(date, TIME_ZONE);
+  return `${p.hour}:${p.minute}`;
+}
+
+function diaryFingerprint(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{S}]+/gu, "")
+    .slice(0, 80);
+}
+
+function cleanDiaryContent(text) {
+  return String(text || "")
+    .replace(/\[\/?DIARY\]/gi, "")
+    .trim()
+    .replace(/\n{3,}/g, "\n\n")
+    .slice(0, DIARY_MCP_MAX_CONTENT);
+}
+
+function writeDiaryEntry(args = {}) {
+  const content = cleanDiaryContent(args.content);
+  if (!content) return { ok: false, reason: "empty_content", message: "日记正文为空，未保存。" };
+
+  const mood = String(args.mood || "").trim();
+  const tags = Array.isArray(args.tags)
+    ? args.tags.map(t => String(t).trim()).filter(Boolean).slice(0, 6)
+    : [];
+  const summary = String(args.summary || "").trim();
+
+  const dir = diaryDirectoryPath();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${diaryDateString()}.md`);
+  const existing = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : "";
+
+  const fp = diaryFingerprint(content);
+  const normalizedExisting = String(existing || "").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+  if (fp && normalizedExisting.includes(fp)) {
+    return { ok: false, reason: "already_exists", message: "这件事今天已经记过，未重复保存。" };
+  }
+
+  const time = diaryTimeString();
+  const header = summary ? `## ${time}｜${summary}` : `## ${time}`;
+  const meta = [
+    mood ? `情绪：${mood}` : "",
+    tags.length ? `标签：${tags.join("、")}` : ""
+  ].filter(Boolean).join("　");
+  const entry = `\n\n${header}\n\n${content}\n${meta ? `\n${meta}\n` : ""}`;
+  fs.appendFileSync(file, entry, "utf-8");
+  return { ok: true, file: path.basename(file), time, saved: content.length };
+}
+
+function listDiaryEntries(args = {}) {
+  const limit = Math.min(Math.max(Number(args.limit) || 10, 1), 30);
+  const entries = readDiaryEntries(limit).map(e => ({
+    date: e.name.replace(/\.md$/i, ""),
+    updated_at: e.updated_at,
+    preview: String(e.content || "").slice(0, DIARY_MCP_PREVIEW)
+  }));
+  return { ok: true, count: entries.length, entries };
+}
+
+const DIARY_MCP_TOOLS = [
+  {
+    name: "write_diary",
+    description: "把今天值得记下的事写进日记。只在确实有值得记录的内容时调用；正文由你在对话里顺带写成，工具只负责保存，不会额外调用模型。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "日记正文/要点，一两句话即可，不要写空话" },
+        mood: { type: "string", description: "可选：当下情绪标签，如 开心/难过/平静/想念" },
+        tags: { type: "array", items: { type: "string" }, description: "可选：关键词标签" },
+        summary: { type: "string", description: "可选：一句话小标题" }
+      },
+      required: ["content"]
+    }
+  },
+  {
+    name: "list_diary",
+    description: "回看最近的日记条目，避免重复记录同一件事。只返回精简预览，不回灌完整历史。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "返回条数，默认 10，最多 30" }
+      }
+    }
+  }
+];
+
+app.options("/mcp", async (req, reply) => {
+  reply.header("Access-Control-Allow-Origin", "*");
+  reply.header("Access-Control-Allow-Headers", "Content-Type, Authorization, MCP-Session-Id");
+  reply.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  return reply.code(204).send();
+});
+
+app.post("/mcp", async (req, reply) => {
+  reply.header("Access-Control-Allow-Origin", "*");
+  const body = req.body || {};
+  const { id, method, params } = body;
+
+  if (method === "initialize") {
+    return reply.send({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        protocolVersion: "2024-11-05",
+        capabilities: { tools: {} },
+        serverInfo: { name: "heartbeat-diary-mcp", version: "1.0.0" },
+        instructions: "日记 MCP。write_diary 只在确实有值得记录的内容时调用，正文由你顺带写成；list_diary 用于回看最近日记、避免重复记录。工具不会额外调用模型。"
+      }
+    });
+  }
+  if (method === "notifications/initialized") return reply.code(202).send({});
+  if (method === "tools/list") return reply.send({ jsonrpc: "2.0", id, result: { tools: DIARY_MCP_TOOLS } });
+  if (method === "tools/call") {
+    const name = params && params.name;
+    const args = (params && params.arguments) || {};
+    let result;
+    if (name === "write_diary") result = writeDiaryEntry(args);
+    else if (name === "list_diary") result = listDiaryEntries(args);
+    else result = { ok: false, message: `未知工具：${name}` };
+    return reply.send({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        isError: !result.ok
+      }
+    });
+  }
+  return reply.code(404).send({ jsonrpc: "2.0", id, error: { code: -32601, message: `未知方法 ${method}` } });
 });
 
 // ========================
