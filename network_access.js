@@ -23,7 +23,7 @@ function decideRequestAccess({
 }) {
   const requestPath = String(path || "").split("?")[0];
   // /test-bark 只是穿过网络层，路由本身仍必须通过与管理页相同的 Basic Auth。
-  if (requestPath.startsWith("/admin") || requestPath.startsWith("/diary") || requestPath === "/healthz" || requestPath === "/test-bark") return { allow: true };
+  if (requestPath.startsWith("/admin") || requestPath === "/healthz" || requestPath === "/test-bark") return { allow: true };
 
   // 批注 2026-08-10：云平台反代的 10/172/192.168 地址不代表最终访客可信；
   // 内部写接口只接受同容器 localhost，不能被公网代理转发后伪造心跳或唤醒事件。
@@ -31,7 +31,7 @@ function decideRequestAccess({
     return isLoopbackIp(ip) ? { allow: true } : { allow: false, status: 403, error: "Forbidden" };
   }
 
-  if (allowPublicApi && (requestPath.startsWith("/v1/") || requestPath === "/mcp")) {
+  if (allowPublicApi && requestPath.startsWith("/v1/")) {
     if (!configuredKey) return { allow: false, status: 401, error: "公网 /v1 已开启，但 GATEWAY_API_KEY 未配置", authRejected: true };
     const bearer = String(authorization || "").match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || "";
     const alternate = String(headerKey || "").trim();
