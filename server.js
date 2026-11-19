@@ -234,11 +234,19 @@ function saveTimeline(messages) {
 function parseTimestampLabel(value) {
   const text = String(value || "");
   const match = text.match(/（?\s*(\d{4})([-/])(\d{1,2})\2(\d{1,2})(?:[ T]?)(\d{1,2})[:：](\d{2})/);
-  if (!match) return null;
-  const [, yyyy, , month, day, hour, minute] = match;
-  // 批注 2026-07-30：Kelivo 写进消息前缀的是用户配置时区的墙上时间；
-  // 公网/Railway 不能按服务器 UTC 解析，否则时间线和自动唤醒都会被推迟。
-  return zonedWallTimeToDate({ year: yyyy, month, day, hour, minute }, TIME_ZONE);
+  if (match) {
+    const [, yyyy, , month, day, hour, minute] = match;
+    // 批注 2026-07-30：Kelivo 写进消息前缀的是用户配置时区的墙上时间；
+    // 公网/Railway 不能按服务器 UTC 解析，否则时间线和自动唤醒都会被推迟。
+    return zonedWallTimeToDate({ year: yyyy, month, day, hour, minute }, TIME_ZONE);
+  }
+  // 兼容 Kelivo 注入的 <current_time>Thu 2026-11-19 08:31:12</current_time> 英文格式
+  const ct = text.match(/<current_time>\s*(?:[A-Za-z]{3},?\s*)?(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})/);
+  if (ct) {
+    const [, yyyy, month, day, hour, minute] = ct;
+    return zonedWallTimeToDate({ year: yyyy, month, day, hour, minute }, TIME_ZONE);
+  }
+  return null;
 }
 
 function stripLeadingTimestamp(content) {

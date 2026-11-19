@@ -15,6 +15,7 @@ const {
 // 批注 2026-08-10：与 Gateway 共用同一 DATA_DIR；未配置时仍落回项目目录，保护旧 VPS/本机部署。
 const DATA_DIR = ensureDataDir();
 const TIMELINE_PATH = runtimeFile("enhanced_messages.json");
+const TIMESTAMP_DB_PATH = runtimeFile("message_timestamps.json");
 const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 const GATEWAY_URL = `${GATEWAY_BASE_URL}/internal/wake-event`;
@@ -334,24 +335,63 @@ function shouldWake(lastUserTime) {
 
 function parseTimelineTimestamp(value) {
   const text = String(value || "");
+  // 兼容中文/无空格前缀 "YYYY-MM-DD HH:mm"、"YYYY-MM-DDHH:mm"
   const match = text.match(/（?\s*(\d{4})([-/])(\d{1,2})\2(\d{1,2})(?:[ T]?)(\d{1,2})[:：](\d{2})/);
-  if (!match) return null;
-  const [, yyyy, , month, day, hour, minute] = match;
-  return zonedWallTimeToDate({ year: yyyy, month, day, hour, minute }, TIME_ZONE);
+  if (match) {
+    const [, yyyy, , month, day, hour, minute] = match;
+    return zonedWallTimeToDate({ year: yyyy, month, day, hour, minute }, TIME_ZONE);
+  }
+  // 兼容 Kelivo 注入的 <current_time>Thu 2026-11-19 08:31:12</current_time> 英文格式
+  const ct = text.match(/<current_time>\s*(?:[A-Za-z]{3},?\s*)?(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})/);
+  if (ct) {
+    const [, yyyy, month, day, hour, minute] = ct;
+    return zonedWallTimeToDate({ year: yyyy, month, day, hour, minute }, TIME_ZONE);
+  }
+  return null;
+}
+
+// 与 server.js 保持一致的消息指纹：role::正文前 150 字（未剥离时间戳 / 剥离时间戳两种）
+function fingerprintOf(content) {
+  const raw = normalizeContentToText(content);
+  return {
+    raw: `user::${raw.trim().slice(0, 150)}`,
+    stripped: `user::${raw.replace(/^（?\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]?)\d{1,2}[:：]\d{2}[）\s]*/, "").trim().slice(0, 150)}`
+  };
+}
+
+function loadTimestampDB() {
+  if (!fs.existsSync(TIMESTAMP_DB_PATH)) return {};
+  try { return JSON.parse(fs.readFileSync(TIMESTAMP_DB_PATH, "utf-8")); } catch { return {}; }
 }
 
 function getLastUserTime(messages) {
+  const tsDB = loadTimestampDB();
   const reversed = [...messages].reverse();
   for (const msg of reversed) {
-    if (msg.role === "user") {
-      const content = normalizeContentToText(msg.content);
-      // 批注 2026-07-15：兼容 Kelivo 时间前缀 "YYYY-MM-DDHH:mm"；
-      // 旧的 "YYYY-MM-DD HH:mm" 仍然可用，避免无空格时间导致 wake-up 误判没有用户时间。
-      const parsed = parseTimelineTimestamp(content);
-      if (parsed) return parsed;
+    if (msg.role !== "user") continue;
+    const content = normalizeContentToText(msg.content);
+    // 批注 2026-07-15：兼容 Kelivo 时间前缀 "YYYY-MM-DDHH:mm"；
+    // 旧的 "YYYY-MM-DD HH:mm" 仍然可用，避免无空格时间导致 wake-up 误判没有用户时间。
+    const parsed = parseTimelineTimestamp(content);
+    if (parsed) return parsed;
+    // 正文解析不出时间时，回查时间戳记忆库兜底（指纹与 server.js 一致）
+    const fp = fingerprintOf(content);
+    const hit = tsDB[fp.raw] || tsDB[fp.stripped];
+    if (hit) {
+      const d = new Date(hit);
+      if (!Number.isNaN(d.getTime())) return d;
     }
   }
-  return null;
+  // 时间线里的 user 消息全部解析不出时间时，取记忆库中最新一条 user 时间作为兜底，
+  // 避免历史消息被刷新冲掉后，后台误判"用户刚发消息"而永不主动唤醒。
+  let latest = null;
+  for (const [key, value] of Object.entries(tsDB)) {
+    if (!key.startsWith("user::")) continue;
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) continue;
+    if (!latest || d > latest) latest = d;
+  }
+  return latest;
 }
 
 function stripPosition(messages) {
